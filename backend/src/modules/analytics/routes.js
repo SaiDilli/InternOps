@@ -11,10 +11,16 @@ async function routes(fastify) {
 
   // Department attendance rate (admin/senior TL)
   fastify.get('/department-attendance', { preHandler: [auth, rbac('ADMIN','SENIOR_TL')] }, async (req) => {
-    const { departmentId, month, year } = req.query;
-    if (!departmentId || !month || !year) throw new Error('departmentId, month, year required');
-    return repo.departmentAttendanceRate(departmentId, month, year);
-  });
+  const { departmentId, month, year } = req.query;
+
+  if (!departmentId || !month || !year) {
+    const err = new Error('departmentId, month, year required');
+    err.statusCode = 400;
+    throw err;
+  }
+
+  return repo.departmentAttendanceRate(departmentId, month, year);
+});
 
   // Top performers
   fastify.get('/top-performers', { preHandler: [auth, rbac('ADMIN','SENIOR_TL','TL')] }, async (req) => {
