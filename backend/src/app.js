@@ -65,7 +65,7 @@ app.register(require('./modules/social-tasks/routes'), { prefix: '/api/tasks' })
 app.register(require('./modules/proof-submissions/routes'), { prefix: '/api/proofs' });
 app.register(require('./modules/notifications/routes'), { prefix: '/api/notifications' });
 app.register(require('./modules/audit/routes'), { prefix: '/api/audit' });
-//app.register(require('./modules/uploads/routes'), { prefix: '/api/uploads' });
+app.register(require('./modules/uploads/routes'), { prefix: '/api/uploads' });
 app.register(require('./modules/analytics/routes'), { prefix: '/api/analytics' });
 app.register(require('./modules/meetings/routes'), { prefix: '/api/meetings' });
 app.register(require('./modules/sessions/routes'), { prefix: '/api/sessions' });
