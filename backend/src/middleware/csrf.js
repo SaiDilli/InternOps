@@ -18,13 +18,15 @@ function verifyToken(token) {
 
 const EXEMPT = ['/api/auth/login','/api/auth/refresh','/api/auth/forgot-password','/api/auth/reset-password'];
 
-function csrfProtection(request, reply, done) {
-  if (['GET','HEAD','OPTIONS'].includes(request.method)) return done();
-  if (EXEMPT.some(p => request.url.startsWith(p))) return done();
-  const token = request.headers['x-csrf-token'];
-  if (!token || !verifyToken(token)) {
-    return reply.status(403).send({ error: 'CSRF token missing or invalid' });
-  }
+function csrfProtection(fastify, opts, done) {
+  fastify.addHook('onRequest', async (request, reply) => {
+    if (['GET','HEAD','OPTIONS'].includes(request.method)) return;
+    if (EXEMPT.some(p => request.url.startsWith(p))) return;
+    const token = request.headers['x-csrf-token'];
+    if (!token || !verifyToken(token)) {
+      return reply.status(403).send({ error: 'CSRF token missing or invalid' });
+    }
+  });
   done();
 }
 
