@@ -39,10 +39,7 @@ async function routes(fastify) {
     async (req, reply) => {
       const force = req.query?.force === 'true';
 
-      const result = await repo.deleteDepartment(
-        req.params.id,
-        force
-      );
+      const result = await repo.deleteDepartment(req.params.id, force);
 
       if (!result.success) {
         return reply.status(409).send({
