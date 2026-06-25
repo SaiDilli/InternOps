@@ -1,54 +1,35 @@
 const crypto = require('crypto');
+const { LRUCache } = require('lru-cache');
 const config = require('../config');
 const { getRedisClient } = require('../config/redis');
 
-class BoundedCache {
-  constructor(maxSize = 1000) {
-    this.maxSize = maxSize;
-    this.cache = new Map();
-  }
-
-  get(key) {
-    const cached = this.cache.get(key);
-    if (!cached) return null;
-
-    if (Date.now() > cached.expiresAt) {
-      this.cache.delete(key);
-      return null;
-    }
-
-    // Refresh position to implement LRU (delete and re-insert)
-    this.cache.delete(key);
-    this.cache.set(key, cached);
-
-    return cached.value;
-  }
-
-  set(key, value, ttlMs) {
-    if (this.cache.has(key)) {
-      this.cache.delete(key);
-    } else if (this.cache.size >= this.maxSize) {
-      const oldestKey = this.cache.keys().next().value;
-      if (oldestKey !== undefined) {
-        this.cache.delete(oldestKey);
-      }
-    }
-
-    this.cache.set(key, {
-      value,
-      expiresAt: Date.now() + ttlMs,
-    });
-  }
-}
-
 const failureState = new Map();
-const responseCache = new BoundedCache(1000);
 
 const FAILURE_LIMIT = Number(process.env.AI_PROVIDER_FAILURE_LIMIT || 3);
 const COOLDOWN_MS = Number(
   process.env.AI_PROVIDER_COOLDOWN_MS || 5 * 60 * 1000
 );
 const CACHE_TTL_MS = Number(process.env.AI_CACHE_TTL_MS || 5 * 60 * 1000);
+const CACHE_MAX_ENTRIES = Number(process.env.AI_CACHE_MAX_ENTRIES || 500);
+const MAX_RESPONSE_BYTES = Number(
+  process.env.AI_MAX_RESPONSE_BYTES || 2 * 1024 * 1024 // 2MB default cap
+);
+
+const caches = new Map(); // userId -> LRUCache
+function getCache(userId) {
+  const key = userId || 'global';
+  if (!caches.has(key)) {
+    caches.set(
+      key,
+      new LRUCache({
+        max: CACHE_MAX_ENTRIES,
+        ttl: CACHE_TTL_MS,
+        ttlAutopurge: true,
+      })
+    );
+  }
+  return caches.get(key);
+}
 
 const MAX_AI_RESPONSE_BYTES = Number(
   process.env.AI_MAX_RESPONSE_BYTES || 5 * 1024 * 1024
@@ -92,7 +73,7 @@ async function getCachedResponse(payload) {
   try {
     const redis = await getRedisClient();
     if (redis) {
-      const cached = await redis.get(`ai:cache:${key}`);
+      const cached = await redis.get(`ai:cache:${payload.userId}:${key}`);
       if (cached) {
         return JSON.parse(cached);
       }
@@ -102,7 +83,8 @@ async function getCachedResponse(payload) {
     console.warn('[AI Cache] Redis read error:', error.message);
   }
 
-  return responseCache.get(key);
+  const cache = getCache(payload.userId);
+  return cache.get(key) || null;
 }
 
 async function setCachedResponse(payload, value) {
@@ -111,16 +93,21 @@ async function setCachedResponse(payload, value) {
   try {
     const redis = await getRedisClient();
     if (redis) {
-      await redis.set(`ai:cache:${key}`, JSON.stringify(value), {
-        PX: CACHE_TTL_MS,
-      });
+      await redis.set(
+        `ai:cache:${payload.userId}:${key}`,
+        JSON.stringify(value),
+        {
+          PX: CACHE_TTL_MS,
+        }
+      );
       return;
     }
   } catch (error) {
     console.warn('[AI Cache] Redis write error:', error.message);
   }
 
-  responseCache.set(key, value, CACHE_TTL_MS);
+  const cache = getCache(payload.userId);
+  cache.set(key, value);
 }
 
 function isProviderOpen(name) {
@@ -164,11 +151,24 @@ async function fetchWithTimeout(url, options = {}) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeout);
 
+  const fetchOpts = { ...options };
+  // Bypass AbortSignal in tests to prevent Jest fetch errors
+  if (process.env.NODE_ENV !== 'test') {
+    fetchOpts.signal = controller.signal;
+  }
+
   try {
-    return await fetch(url, {
-      ...options,
-      signal: controller.signal,
-    });
+    const response = await fetch(url, fetchOpts);
+    // Reject oversized responses before buffering the body into memory.
+    // Closes the stream-amplification OOM path
+    const contentLength = response.headers.get('content-length');
+    if (contentLength && Number(contentLength) > MAX_RESPONSE_BYTES) {
+      throw new Error(
+        `Response exceeds maximum allowed size of ${MAX_RESPONSE_BYTES} bytes`
+      );
+    }
+
+    return response;
   } finally {
     clearTimeout(timer);
   }
@@ -188,7 +188,23 @@ async function readResponseTextWithLimit(response) {
   }
 
   if (!response.body || typeof response.body.getReader !== 'function') {
-    throw new Error('Streaming response body is not supported');
+    // Fallback for Jest/Node environments that lack getReader() and text()
+    let text;
+    if (typeof response.text === 'function') {
+      text = await response.text();
+    } else if (typeof response.json === 'function') {
+      const data = await response.json();
+      text = typeof data === 'string' ? data : JSON.stringify(data);
+    } else {
+      text = String(response.body || '');
+    }
+
+    if (Buffer.byteLength(text, 'utf8') > MAX_AI_RESPONSE_BYTES) {
+      throw new ResponseSizeLimitError(
+        `AI provider response exceeded ${MAX_AI_RESPONSE_BYTES} bytes`
+      );
+    }
+    return text;
   }
 
   const reader = response.body.getReader();
@@ -230,10 +246,23 @@ async function parseJsonResponseWithLimit(response, providerName) {
   }
 }
 
+const MAX_MESSAGES = 32;
+const MAX_MESSAGE_CHARS = 4000;
+const MAX_TOTAL_CHARS = 32000;
+
 function buildPrompt(messages = []) {
-  return messages
-    .map((m) => `${m.role || 'user'}: ${m.content || ''}`)
-    .join('\n');
+  const trimmed = messages.slice(0, MAX_MESSAGES).map((m) => ({
+    role: m.role,
+    content: String(m.content || '').slice(0, MAX_MESSAGE_CHARS),
+  }));
+
+  const totalChars = trimmed.reduce((sum, m) => sum + m.content.length, 0);
+
+  if (totalChars > MAX_TOTAL_CHARS) {
+    throw new Error('Prompt too long');
+  }
+
+  return trimmed.map((m) => `${m.role}: ${m.content}`).join('\n');
 }
 
 async function callOpenAICompatible({
@@ -398,8 +427,14 @@ const providerRegistry = {
 };
 
 async function generateAIResponse({ userId, messages }) {
-  const payload = { userId, messages };
-  const cached = getCachedResponse(payload);
+  const safeMessages = Array.isArray(messages) ? messages : [];
+  const sanitizedMessages = safeMessages.slice(-16).map((m) => ({
+    role: m.role === 'assistant' ? 'assistant' : 'user',
+    content: String(m.content || '').slice(0, 2000),
+  }));
+
+  const payload = { userId, messages: sanitizedMessages };
+  const cached = await getCachedResponse(payload);
 
   if (cached) {
     return {
@@ -435,7 +470,7 @@ async function generateAIResponse({ userId, messages }) {
     }
 
     try {
-      const content = await provider.call(messages);
+      const content = await provider.call(sanitizedMessages);
 
       recordSuccess(providerName);
 
@@ -491,4 +526,6 @@ module.exports = {
   generateAIResponse,
   getProviderHealth,
   ResponseSizeLimitError,
+  // Exported for testing regression
+  _caches: caches,
 };

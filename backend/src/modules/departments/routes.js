@@ -2,7 +2,6 @@ const auth = require('../../middleware/auth');
 const rbac = require('../../middleware/rbac');
 const { csrfMiddleware } = require('../../middleware/csrf');
 const repo = require('./repository');
-const { createAuditLog } = require('../../utils/audit');
 
 async function routes(fastify) {
   // Create a department (Admin only)
@@ -17,14 +16,12 @@ async function routes(fastify) {
       }
 
       const dept = await repo.createDepartment(name, req.user.id);
-
-      await createAuditLog({
+      req.auditOnResponse = {
         userId: req.user.id,
         action: 'DEPARTMENT_CREATED',
         resourceType: 'department',
         resourceId: dept.id,
-      });
-
+      };
       return dept;
     }
   );
@@ -48,7 +45,7 @@ async function routes(fastify) {
         });
       }
 
-      await createAuditLog({
+      req.auditOnResponse = {
         userId: req.user.id,
         action: 'DEPARTMENT_DELETED',
         resourceType: 'department',
@@ -56,7 +53,7 @@ async function routes(fastify) {
         details: {
           force,
         },
-      });
+      };
 
       return {
         success: true,
