@@ -11,35 +11,62 @@ async function routes(fastify) {
     { preHandler: [auth, rbac('ADMIN'), csrfMiddleware] },
     async (req, reply) => {
       const name = (req.body?.name || '').trim();
-      if (!name) return reply.status(400).send({ error: 'Name required' });
+
+      if (!name) {
+        return reply.status(400).send({ error: 'Name required' });
+      }
+
       const dept = await repo.createDepartment(name, req.user.id);
+
       await createAuditLog({
         userId: req.user.id,
         action: 'DEPARTMENT_CREATED',
         resourceType: 'department',
         resourceId: dept.id,
       });
+
       return dept;
     }
   );
 
-  // List departments (any authenticated user — needed for member forms/dropdowns)
+  // List departments
   fastify.get('/', { preHandler: [auth] }, async () => repo.getAll());
 
-  // Soft-delete a department (Admin only)
+  // Delete department
   fastify.delete(
     '/:id',
     { preHandler: [auth, rbac('ADMIN'), csrfMiddleware] },
-    async (req) => {
-      await repo.softDelete(req.params.id);
+    async (req, reply) => {
+      const force = req.query?.force === 'true';
+
+      const result = await repo.deleteDepartment(
+        req.params.id,
+        force
+      );
+
+      if (!result.success) {
+        return reply.status(409).send({
+          error: `Department has ${result.userCount} assigned users. Reassign them first or use ?force=true.`,
+          userCount: result.userCount,
+        });
+      }
+
       await createAuditLog({
         userId: req.user.id,
         action: 'DEPARTMENT_DELETED',
         resourceType: 'department',
         resourceId: req.params.id,
+        details: {
+          force,
+        },
       });
-      return { success: true };
+
+      return {
+        success: true,
+        force,
+      };
     }
   );
 }
+
 module.exports = routes;
