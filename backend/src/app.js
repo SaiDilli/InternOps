@@ -10,7 +10,7 @@ const noticesRoutes = require('./modules/notices/routes');
 
 const app = Fastify({
   trustProxy:
-    config.nodeEnv === 'production' ? [config.trustedProxyCidr] : 'loopback',
+    config.nodeEnv === 'production' ? true : 'loopback',
   logger:
     config.nodeEnv === 'development'
       ? { transport: { target: 'pino-pretty' } }
